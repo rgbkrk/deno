@@ -29,7 +29,8 @@ use jupyter_protocol::StreamContent;
 use jupyter_protocol::messaging;
 use jupyter_runtime::KernelControlConnection;
 use jupyter_runtime::KernelIoPubConnection;
-use jupyter_runtime::KernelShellConnection;
+use jupyter_runtime::RouterRecvConnection;
+use jupyter_runtime::RouterSendConnection;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -41,6 +42,7 @@ pub struct JupyterServer {
   execution_count: ExecutionCount,
   last_execution_request: Arc<Mutex<Option<JupyterMessage>>>,
   iopub_connection: Arc<Mutex<KernelIoPubConnection>>,
+  shell_writer: RouterSendConnection,
   repl_session_proxy: JupyterReplProxy,
 }
 
@@ -72,6 +74,7 @@ impl JupyterServer {
       &session_id,
     )
     .await?;
+    let (shell_writer, mut shell_reader) = shell_connection.split();
     let control_connection = jupyter_runtime::create_kernel_control_connection(
       &connection_info,
       &session_id,
@@ -113,6 +116,7 @@ impl JupyterServer {
     let mut server = Self {
       execution_count: ExecutionCount::new(0),
       iopub_connection: iopub_connection.clone(),
+      shell_writer,
       last_execution_request: last_execution_request.clone(),
       repl_session_proxy,
     };
@@ -155,7 +159,7 @@ impl JupyterServer {
     });
 
     let shell_fut = deno_core::unsync::spawn(async move {
-      if let Err(err) = server.handle_shell(shell_connection).await {
+      if let Err(err) = server.handle_shell(&mut shell_reader).await {
         log::error!("Shell error: {}\nBacktrace:\n{}", err, err.backtrace());
       }
     });
@@ -246,18 +250,17 @@ impl JupyterServer {
 
   async fn handle_shell(
     &mut self,
-    mut connection: KernelShellConnection,
+    reader: &mut RouterRecvConnection,
   ) -> Result<(), AnyError> {
     loop {
-      let msg = connection.read().await?;
-      self.handle_shell_message(msg, &mut connection).await?;
+      let msg = reader.read().await?;
+      self.handle_shell_message(msg).await?;
     }
   }
 
   async fn handle_shell_message(
     &mut self,
     msg: JupyterMessage,
-    connection: &mut KernelShellConnection,
   ) -> Result<(), AnyError> {
     let parent = &msg.clone();
 
@@ -268,7 +271,7 @@ impl JupyterServer {
     match msg.content {
       JupyterMessageContent::ExecuteRequest(execute_request) => {
         self
-          .handle_execution_request(execute_request, parent, connection)
+          .handle_execution_request(execute_request, parent)
           .await?;
       }
       JupyterMessageContent::CompleteRequest(req) => {
@@ -296,7 +299,8 @@ impl JupyterServer {
             .map(|item| item.range.end)
             .unwrap_or(cursor_pos);
 
-          connection
+          self
+            .shell_writer
             .send(
               messaging::CompleteReply {
                 matches,
@@ -358,7 +362,8 @@ impl JupyterServer {
             }
           };
 
-          connection
+          self
+            .shell_writer
             .send(
               messaging::CompleteReply {
                 matches: completions,
@@ -393,7 +398,8 @@ impl JupyterServer {
         //   },
         // }
 
-        connection
+        self
+          .shell_writer
           .send(
             messaging::InspectReply {
               status: ReplyStatus::Ok,
@@ -408,15 +414,20 @@ impl JupyterServer {
       }
 
       JupyterMessageContent::IsCompleteRequest(_) => {
-        connection
+        self
+          .shell_writer
           .send(messaging::IsCompleteReply::complete().as_child_of(parent))
           .await?;
       }
       JupyterMessageContent::KernelInfoRequest(_) => {
-        connection.send(kernel_info().as_child_of(parent)).await?;
+        self
+          .shell_writer
+          .send(kernel_info().as_child_of(parent))
+          .await?;
       }
       JupyterMessageContent::CommOpen(comm) => {
-        connection
+        self
+          .shell_writer
           .send(
             messaging::CommClose {
               comm_id: comm.comm_id,
@@ -427,7 +438,8 @@ impl JupyterServer {
           .await?;
       }
       JupyterMessageContent::HistoryRequest(_req) => {
-        connection
+        self
+          .shell_writer
           .send(
             messaging::HistoryReply {
               history: vec![],
@@ -443,7 +455,8 @@ impl JupyterServer {
         // NOTE: This will belong on the stdin channel, not the shell channel
       }
       JupyterMessageContent::CommInfoRequest(_req) => {
-        connection
+        self
+          .shell_writer
           .send(
             messaging::CommInfoReply {
               comms: Default::default(),
@@ -478,7 +491,6 @@ impl JupyterServer {
     &mut self,
     execute_request: messaging::ExecuteRequest,
     parent_message: &JupyterMessage,
-    connection: &mut KernelShellConnection,
   ) -> Result<(), AnyError> {
     if !execute_request.silent && execute_request.store_history {
       self.execution_count.increment();
@@ -513,7 +525,8 @@ impl JupyterServer {
             .as_child_of(parent_message),
           )
           .await?;
-        connection
+        self
+          .shell_writer
           .send(
             messaging::ExecuteReply {
               execution_count: self.execution_count,
@@ -542,7 +555,8 @@ impl JupyterServer {
       )
       .await?;
 
-      connection
+      self
+        .shell_writer
         .send(
           messaging::ExecuteReply {
             execution_count: self.execution_count,
@@ -642,7 +656,8 @@ impl JupyterServer {
           .as_child_of(parent_message),
         )
         .await?;
-      connection
+      self
+        .shell_writer
         .send(
           messaging::ExecuteReply {
             execution_count: self.execution_count,
