@@ -207,8 +207,17 @@ async fn connect_socket<S: zeromq::Socket>(
   spec: &ConnectionSpec,
   port: u16,
 ) -> S {
+  connect_socket_with_options::<S>(spec, port, zeromq::SocketOptions::default())
+    .await
+}
+
+async fn connect_socket_with_options<S: zeromq::Socket>(
+  spec: &ConnectionSpec,
+  port: u16,
+  options: zeromq::SocketOptions,
+) -> S {
   let addr = spec.endpoint(port);
-  let mut socket = S::new();
+  let mut socket = S::with_options(options);
   match timeout(Duration::from_millis(5000), socket.connect(&addr)).await {
     Ok(Ok(_)) => socket,
     Ok(Err(e)) => {
@@ -228,7 +237,7 @@ struct JupyterClient {
   control: Arc<Mutex<zeromq::DealerSocket>>,
   shell: Arc<Mutex<zeromq::DealerSocket>>,
   io_pub: Arc<Mutex<zeromq::SubSocket>>,
-  stdin: Arc<Mutex<zeromq::RouterSocket>>,
+  stdin: Arc<Mutex<zeromq::DealerSocket>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -248,16 +257,37 @@ impl JupyterClient {
   }
 
   async fn new_with_timeout(spec: &ConnectionSpec, timeout: Duration) -> Self {
+    // Create a shared identity for shell and stdin so the kernel can route
+    // input_request messages correctly. The kernel copies zmq_identities from
+    // execute_request (received on shell) to input_request (sent on stdin),
+    // so both sockets need the same identity.
+    let session = Uuid::new_v4();
+    let identity =
+      zeromq::util::PeerIdentity::try_from(session.as_bytes().as_slice())
+        .expect("UUID bytes should be valid identity");
+    let mut shell_options = zeromq::SocketOptions::default();
+    shell_options.peer_identity(identity.clone());
+    let mut stdin_options = zeromq::SocketOptions::default();
+    stdin_options.peer_identity(identity);
+
     let (heartbeat, control, shell, io_pub, stdin) = tokio::join!(
       connect_socket::<zeromq::ReqSocket>(spec, spec.hb_port),
       connect_socket::<zeromq::DealerSocket>(spec, spec.control_port),
-      connect_socket::<zeromq::DealerSocket>(spec, spec.shell_port),
+      connect_socket_with_options::<zeromq::DealerSocket>(
+        spec,
+        spec.shell_port,
+        shell_options
+      ),
       connect_socket::<zeromq::SubSocket>(spec, spec.iopub_port),
-      connect_socket::<zeromq::RouterSocket>(spec, spec.stdin_port),
+      connect_socket_with_options::<zeromq::DealerSocket>(
+        spec,
+        spec.stdin_port,
+        stdin_options
+      ),
     );
 
     Self {
-      session: Uuid::new_v4(),
+      session,
       heartbeat: Arc::new(Mutex::new(heartbeat)),
       control: Arc::new(Mutex::new(control)),
       shell: Arc::new(Mutex::new(shell)),
@@ -625,6 +655,86 @@ async fn jupyter_store_history_false() -> Result<()> {
       "execution_count": 0,
     }),
   );
+
+  Ok(())
+}
+
+#[test]
+async fn jupyter_stdin_input() -> Result<()> {
+  let (_ctx, client, _process) = setup().await;
+
+  // Spawn a task to handle the stdin input_request and send input_reply
+  let stdin_client = client.clone();
+  let stdin_handler = tokio::spawn(async move {
+    // Wait for input_request from kernel
+    let input_request = stdin_client.recv(Stdin).await.unwrap();
+    assert_eq!(input_request.header.msg_type, "input_request");
+
+    // Send input_reply back with the test value
+    // For DEALER socket, don't include routing_prefix as zeromq handles routing
+    let reply = JupyterMsg {
+      routing_prefix: vec![],
+      header: MsgHeader {
+        msg_type: "input_reply".into(),
+        session: input_request.header.session,
+        ..Default::default()
+      },
+      parent_header: input_request.header.to_json(),
+      content: json!({ "value": "test_input_value", "status": "ok" }),
+      ..Default::default()
+    };
+    stdin_client.send_msg(Stdin, reply).await.unwrap();
+  });
+
+  // Execute code that calls Jupyter.input()
+  let _request = client
+    .send(
+      Shell,
+      "execute_request",
+      json!({
+        "silent": false,
+        "store_history": true,
+        "user_expressions": {},
+        "allow_stdin": true,
+        "stop_on_error": false,
+        "code": r#"const result = prompt("Enter value:"); console.log("Got: " + result);"#,
+      }),
+    )
+    .await?;
+
+  // Wait for stdin handler to complete
+  stdin_handler.await?;
+
+  let reply = client.recv(Shell).await?;
+  assert_eq!(reply.header.msg_type, "execute_reply");
+  assert_json_subset(
+    reply.content,
+    json!({
+      "status": "ok",
+      "execution_count": 1,
+    }),
+  );
+
+  // Check that the output contains the input value
+  let mut found_output = false;
+  for _ in 0..6 {
+    match client.recv(IoPub).await {
+      Ok(msg) => {
+        if msg.header.msg_type == "stream"
+          && let Some(text) = msg.content.get("text")
+          && text
+            .as_str()
+            .unwrap_or("")
+            .contains("Got: test_input_value")
+        {
+          found_output = true;
+          break;
+        }
+      }
+      Err(_) => break,
+    }
+  }
+  assert!(found_output, "Expected output with input value not found");
 
   Ok(())
 }
