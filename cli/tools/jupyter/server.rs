@@ -80,11 +80,12 @@ impl JupyterServer {
       &session_id,
     )
     .await?;
-    let mut stdin_connection = jupyter_runtime::create_kernel_stdin_connection(
+    let stdin_connection = jupyter_runtime::create_kernel_stdin_connection(
       &connection_info,
       &session_id,
     )
     .await?;
+    let (mut stdin_writer, mut stdin_reader) = stdin_connection.split();
     let iopub_connection = jupyter_runtime::create_kernel_iopub_connection(
       &connection_info,
       &session_id,
@@ -121,25 +122,26 @@ impl JupyterServer {
       repl_session_proxy,
     };
 
-    let stdin_fut = deno_core::unsync::spawn(async move {
-      loop {
-        let Some(msg) = stdin_rx1.recv().await else {
+    let stdin_send_fut = deno_core::unsync::spawn(async move {
+      while let Some(msg) = stdin_rx1.recv().await {
+        if stdin_writer.send(msg).await.is_err() {
           return;
-        };
-        let Ok(()) = stdin_connection.send(msg).await else {
-          return;
-        };
-
-        let Ok(msg) = stdin_connection.read().await else {
-          return;
-        };
-        let Ok(()) = stdin_tx2.send(msg) else {
-          return;
-        };
+        }
       }
     });
 
-    let hearbeat_fut = deno_core::unsync::spawn(async move {
+    let stdin_recv_fut = deno_core::unsync::spawn(async move {
+      loop {
+        let Ok(msg) = stdin_reader.read().await else {
+          return;
+        };
+        if stdin_tx2.send(msg).is_err() {
+          return;
+        }
+      }
+    });
+
+    let heartbeat_fut = deno_core::unsync::spawn(async move {
       loop {
         if let Err(err) = heartbeat.single_heartbeat().await {
           log::error!("Heartbeat error: {}", err);
@@ -175,15 +177,13 @@ impl JupyterServer {
       }
     });
 
-    let repl_session_fut = deno_core::unsync::spawn(async move {});
-
     let join_fut = futures::future::try_join_all(vec![
-      hearbeat_fut,
+      heartbeat_fut,
       control_fut,
       shell_fut,
       stdio_fut,
-      repl_session_fut,
-      stdin_fut,
+      stdin_send_fut,
+      stdin_recv_fut,
     ]);
 
     if let Ok(result) = join_fut.or_cancel(cancel_handle).await {
